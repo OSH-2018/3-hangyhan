@@ -1,8 +1,8 @@
 //算法思想
-//文件在mem[1] ~ mem[n]上分块存储，mem[i]由mmap映射到进程地址空间中
+//文件在mem[2] ~ mem[n]上分块存储，mem[i]由mmap映射到进程地址空间中
 //mem[0]存储文件的分块信息表，以[file_name][blocknum[]]为一行
+//mem[1]指向存储文件个数的内存空间
 //文件信息（文件名）
-
 #define FUSE_USE_VERSION 26
 #include <string.h>
 #include <stdlib.h>
@@ -13,9 +13,8 @@
 #define SIZE 4*1024*1024*1024 //文件系统大小
 #define BLOCKSIZE 64*1024 //文件分块大小
 #define INDEXSIZE 1024*1024 //索引表大小
-#define BLOCKNUM 64*1024 //block总数 
+#define BLOCKNUM 64*1024 //block总数
 
-int filenum = 0; //文件个数
 
 typedef struct indexline{//索引项
     char file_name[ 20 ] ;
@@ -43,7 +42,8 @@ static void *oshfs_init(struct fuse_conn_info *conn) //初始化文件系统 FIN
 {
     mem[0] = ( indextable )mmap(NULL, INDEXSIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0); //分配索引表地址空间
     memset( mem + 1, 0, 4*(BLOCKNUM-1) );
-    filenum = 0;
+    mem[1] = ( int * )mmap(NULL, sizeof( int ), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);  //分配存储文件个数的空间
+    *(int *)mem[ 1 ] = 0;
     return NULL;
 
 }
@@ -55,7 +55,7 @@ int get_filenode(const char *name)//查找文件并返回文件在索引表中�
 
     int i = 0;
 
-    while( i < filenum ) {
+    while( i < (*(int *)mem[ 1 ]) ) {
 
         if(strcmp( (( indexpointer )(mem[ 0 ] + i)) -> file_name, name + 1) != 0)
             i ++;
@@ -82,16 +82,16 @@ static void create_filenode(const char *filename, const struct stat *st)//创建
     memcpy( mem[ i ], st, sizeof( struct stat ) );*/
 
     //为文件添加索引和相关信息
-    strcpy( ( ( indexpointer )( mem[ 0 ] + filenum ) ) -> file_name,  filename );
-    (( ( indexpointer )( mem[ 0 ] + filenum ) ) -> st).st_mode = st -> st_mode;
-    (( ( indexpointer )( mem[ 0 ] + filenum ) ) -> st).st_uid = st -> st_uid;
-    (( ( indexpointer )( mem[ 0 ] + filenum ) ) -> st).st_gid = st -> st_gid;
-    (( ( indexpointer )( mem[ 0 ] + filenum ) ) -> st).st_nlink = st -> st_nlink;
-    (( ( indexpointer )( mem[ 0 ] + filenum ) ) -> st).st_size = st -> st_size;
-    ( ( indexpointer )( mem[ 0 ] + filenum ) ) -> blocknum = 0;
+    strcpy( ( ( indexpointer )( mem[ 0 ] + (*(int *)mem[ 1 ]) ) ) -> file_name,  filename );
+    (( ( indexpointer )( mem[ 0 ] + (*(int *)mem[ 1 ]) ) ) -> st).st_mode = st -> st_mode;
+    (( ( indexpointer )( mem[ 0 ] + (*(int *)mem[ 1 ]) ) ) -> st).st_uid = st -> st_uid;
+    (( ( indexpointer )( mem[ 0 ] + (*(int *)mem[ 1 ]) ) ) -> st).st_gid = st -> st_gid;
+    (( ( indexpointer )( mem[ 0 ] + (*(int *)mem[ 1 ]) ) ) -> st).st_nlink = st -> st_nlink;
+    (( ( indexpointer )( mem[ 0 ] + (*(int *)mem[ 1 ]) ) ) -> st).st_size = st -> st_size;
+    ( ( indexpointer )( mem[ 0 ] + (*(int *)mem[ 1 ]) ) ) -> blocknum = 0;
 
     //修改文件系统信息
-    filenum ++ ;
+    (*(int *)mem[ 1 ]) ++ ;
 
     return  ;
 
@@ -130,7 +130,7 @@ static int oshfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler, of
     int i = 0;
     filler(buf, ".", NULL, 0);
     filler(buf, "..", NULL, 0);
-    while( i < filenum ) {
+    while( i < (*(int *)mem[ 1 ]) ) {
         filler(buf, (( indexpointer )( mem[ 0 ] + i )) -> file_name, &( ((indexpointer)( mem[ 0 ] + i)) -> st ), 0);
         i ++;
     }
@@ -184,7 +184,7 @@ static int oshfs_write(const char *path, const char *buf, size_t size, off_t off
         ( fileindex -> blocknum )++;
 
     }
-    
+
 
     //写文件
     char *write_pointer = (char *)buf;
@@ -248,7 +248,10 @@ static int oshfs_truncate(const char *path, off_t size)//调整文件大小 FINI
     else{
         if( new_blocknum < fileindex -> blocknum){//如果new_blocknum < blocknum就要释放多余的块
 
-            for( i = new_blocknum; i < fileindex -> blocknum; i++ )munmap( mem[ ( fileindex -> blockno )[ i ] ], BLOCKSIZE);
+            for( i = new_blocknum; i < fileindex -> blocknum; i++ ){
+              munmap( mem[ ( fileindex -> blockno )[ i ] ], BLOCKSIZE);
+              mem[ ( fileindex -> blockno )[ i ] ] = NULL;
+            }
 
         }
     }
@@ -264,7 +267,7 @@ static int oshfs_truncate(const char *path, off_t size)//调整文件大小 FINI
 static int oshfs_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi)//读取文件 FINISHED
 
 {
-   
+
     int filepos = get_filenode(path);
     int ret = size;
     int filesize = ( ( ( indexpointer )( mem[ 0 ] + filepos ) ) -> st ).st_size;
@@ -291,10 +294,10 @@ static int oshfs_read(const char *path, char *buf, size_t size, off_t offset, st
 
     if( ( ret + start[ 1 ] ) <= BLOCKSIZE ){ //对于不需要跨块read的情况单独处理
         memcpy( pointer, mem[ blockno[ start[ 0 ] ] ] + start[ 1 ], ret );
-        *( pointer + 1 ) = '\0';
+        //*( pointer + 1 ) = '\0';
         return ret;
     }
-    
+
     //对于第一块单独处理
     memcpy( pointer, mem[ blockno[ start[ 0 ] ] ] + start[ 1 ], BLOCKSIZE - start[ 1 ]);
     pointer += BLOCKSIZE - start[ 1 ];
@@ -308,8 +311,8 @@ static int oshfs_read(const char *path, char *buf, size_t size, off_t offset, st
     }
 
     memcpy( pointer, mem[ blockno[ i ] ] , remain);//对最后一块单独处理
-    *( pointer + 1 ) = '\0';
-    
+    //*( pointer + 1 ) = '\0';
+
 
     return ret;
 }
@@ -327,17 +330,18 @@ static int oshfs_unlink(const char *path)//删除文件 FINISHED
     //munmap所有已经分配的块
     for( i = 0; i < ( fileindex -> blocknum ); i++ ){
         munmap( mem[ (fileindex -> blockno)[ i ] ], BLOCKSIZE );
+        mem[ (fileindex -> blockno)[ i ] ] = NULL;
     }
 
     //整理文件索引表
     indexpointer fileindex1 ;
     indexpointer fileindex2 ;
-    for( i = filepos; i < ( filenum - 1 ); i++ ){
+    for( i = filepos; i < ( (*(int *)mem[ 1 ]) - 1 ); i++ ){
         memcpy( fileindex1, fileindex2, sizeof( indexline ) );
     }
 
     //修改文件系统大小
-    filenum --;
+    (*(int *)mem[ 1 ]) --;
 
     return 0;
 
